@@ -26,7 +26,12 @@ class BrowserHandoffManager:
         """Formatiert das flache Cookie-Dict in das von Playwright benötigte Format."""
         domain = urlparse(target_url).netloc
         return [
-            {"name": name, "value": value, "domain": domain, "path": "/"}
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+            }
             for name, value in cookies.items()
         ]
 
@@ -52,6 +57,8 @@ class BrowserHandoffManager:
             # 1. Session-Daten (Cookies) injizieren
             pw_cookies = self._format_cookies_for_playwright(session_data.cookies, target_url)
             if pw_cookies:
+                # Targeted Ignore, da Playwright intern ein TypedDict erwartet,
+                # unsere Standard-Dicts zur Laufzeit aber perfekt verarbeitet.
                 await context.add_cookies(pw_cookies)
                 logger.info("cookies_injected", count=len(pw_cookies))
 
@@ -98,7 +105,9 @@ class BrowserHandoffManager:
 
                         captured_payloads[endpoint_key] = payload
                         logger.info(
-                            "json_payload_intercepted", method=request.method, path=parsed_url.path
+                            "json_payload_intercepted",
+                            method=request.method,
+                            path=parsed_url.path,
                         )
                     except json.JSONDecodeError:
                         # War kein JSON. Ignorieren wir hier.
