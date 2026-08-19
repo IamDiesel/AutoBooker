@@ -1,0 +1,42 @@
+[project]
+name = "autobooker"
+version = "0.1.0"
+description = "High-Speed Automated Checkout Bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[http2]>=0.27.0",
+    "playwright>=1.46.0",
+    "pydantic>=2.8.2",
+    "rich>=13.7.1",
+    "structlog>=24.4.0",
+    "transitions>=0.9.1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11.1",
+    "pre-commit>=3.8.0",
+    "pytest-asyncio>=0.23.8",
+    "pytest>=8.3.2",
+    "respx>=0.21.1",
+    "ruff>=0.5.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"] # Error, Flake, Isort, PyUpgrade, Bugbear, Simplify
+ignore = []
+
+[tool.mypy]
+strict = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+disallow_untyped_decorators = false
+
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
