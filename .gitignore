@@ -1,0 +1,19 @@
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual Environments (uv)
+.venv/
+env/
+venv/
+
+# CRITICAL: Unsere extrahierten Session-Daten & Cookies
+.data/
+
+# IDE Settings
+.vscode/
+.idea/
