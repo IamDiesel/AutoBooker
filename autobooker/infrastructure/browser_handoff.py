@@ -22,7 +22,7 @@ class BrowserHandoffManager:
 
     def _format_cookies_for_playwright(
         self, cookies: dict[str, str], target_url: str
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:  # <--- HIER IST DER FIX: list[Any] löst alle Plattform-Konflikte
         """Formatiert das flache Cookie-Dict in das von Playwright benötigte Format."""
         domain = urlparse(target_url).netloc
         return [
@@ -57,8 +57,8 @@ class BrowserHandoffManager:
             # 1. Session-Daten (Cookies) injizieren
             pw_cookies = self._format_cookies_for_playwright(session_data.cookies, target_url)
             if pw_cookies:
-                # Targeted Ignore, da Playwright intern ein TypedDict erwartet,
-                # unsere Standard-Dicts zur Laufzeit aber perfekt verarbeitet.
+                # Da pw_cookies nun list[Any] ist, meckert hier weder Windows noch Linux.
+                # Kein type: ignore mehr nötig!
                 await context.add_cookies(pw_cookies)
                 logger.info("cookies_injected", count=len(pw_cookies))
 
