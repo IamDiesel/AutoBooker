@@ -122,25 +122,38 @@ class FastCheckoutApiClient:
         return SessionData(cookies=cookies_dict)
 
     async def submit_booking(
-        self, endpoint_path: str, payload: dict[str, Any], max_retries: int = 5
+        self,
+        endpoint_path: str,
+        json_payload: dict[str, Any] | None = None,
+        form_payload: str | None = None,
+        max_retries: int = 5,
     ) -> httpx.Response:
         """
-        Sendet den Buchungs-Payload mit aggressivem Retry-Looping
-        bei 5xx Server-Fehlern (Überlastung).
+        Sendet den Buchungs-Payload mit aggressivem Retry-Looping.
+        Unterstützt dynamisch sowohl JSON- als auch klassische Form-Data-Schnittstellen.
         """
         logger.info("api_submit_booking_start", endpoint=endpoint_path)
 
+        headers = {}
+        request_kwargs: dict[str, Any] = {}
+
+        if form_payload is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            request_kwargs["content"] = form_payload
+        elif json_payload is not None:
+            request_kwargs["json"] = json_payload
+        else:
+            raise ValueError("Weder json_payload noch form_payload wurden übergeben.")
+
         for attempt in range(1, max_retries + 1):
             try:
-                response = await self.client.post(endpoint_path, json=payload)
+                response = await self.client.post(endpoint_path, headers=headers, **request_kwargs)
 
-                # Wenn der Server wegen Überlastung crasht (500, 502, 503, 504),
-                # sofort nochmal versuchen
                 if response.status_code >= 500:
                     logger.warning(
                         "server_error_retry", status=response.status_code, attempt=attempt
                     )
-                    await asyncio.sleep(0.2)  # 200 Millisekunden Pause vor dem nächsten Hammer
+                    await asyncio.sleep(0.2)
                     continue
 
                 self._check_response_for_bot_protection(response)

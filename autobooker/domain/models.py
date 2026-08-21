@@ -3,35 +3,42 @@ from typing import Any
 
 from pydantic import BaseModel, Field, HttpUrl
 
+from autobooker.domain.strategy import AvailableOption, BookingStrategy
+
 
 class RunMode(StrEnum):
-    EXPLORATION = "exploration"  # Dry-Run bis kurz vor Abschluss
+    EXPLORATION = "exploration"
     LIVE_ATTEMPT_1 = "live_attempt_1"
     LIVE_ATTEMPT_2 = "live_attempt_2"
 
 
 class BookingTarget(BaseModel):
-    """Repräsentiert den Ziel-Termin/die Leistung."""
-
     service_id: str
     preferred_date: str | None = None
     preferred_time: str | None = None
 
 
 class SessionData(BaseModel):
-    """Überlebenswichtige Daten, die zwischen Exploration und Live-Run gespeichert werden."""
+    """Daten, die zwischen Exploration und Live-Run gespeichert werden."""
 
     cookies: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     csrf_token: str | None = None
-    known_payloads: dict[str, Any] = Field(
-        default_factory=dict, description="In der Exploration gelernte Formular-Daten"
-    )
+    known_payloads: dict[str, Any] = Field(default_factory=dict)
+    discovered_options: list[AvailableOption] = Field(default_factory=list)
+    strategy: BookingStrategy = Field(default_factory=BookingStrategy)
+
+    # GUI Persistenz & Settings
+    dummy_url: str = ""
+    live_url: str = ""
+    poll_interval_ms: int = Field(default=500, ge=100)
+
+    # Credentials für Auto-Login
+    username: str = ""
+    password: str = ""
 
 
 class TaskConfig(BaseModel):
-    """Konfiguration für den aktuellen Start des Bots."""
-
     target_url: HttpUrl
     target: BookingTarget
     mode: RunMode = Field(default=RunMode.EXPLORATION)
@@ -39,8 +46,6 @@ class TaskConfig(BaseModel):
 
 
 class BookingContext(BaseModel):
-    """Wird durch die State Machine gereicht und ggfs. auf Festplatte persistiert."""
-
     config: TaskConfig
     session_data: SessionData = Field(default_factory=SessionData)
     last_error: str | None = None

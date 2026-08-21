@@ -1,4 +1,8 @@
 import asyncio
+import re
+import time
+from collections.abc import Callable
+from pathlib import Path
 
 import structlog
 
@@ -10,18 +14,37 @@ from autobooker.infrastructure.session_store import SessionStore
 
 logger = structlog.get_logger(__name__)
 
+__all__ = ["BookingOrchestrator"]
+
 
 class BookingOrchestrator:
-    def __init__(self, config: TaskConfig, store: SessionStore) -> None:
+    def __init__(
+        self,
+        config: TaskConfig,
+        store: SessionStore,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self.config = config
         self.store = store
+        self.progress_callback = progress_callback
         self.state_machine = BookingStateMachine()
         self.context = BookingContext(config=self.config, session_data=self.store.load())
 
+        # Flag für den asynchronen Abbruch
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Signalisiert der laufenden Engine, dass sie abbrechen soll."""
+        self._cancel_requested = True
+
+    def _log_progress(self, message: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(message)
+        logger.info("progress", message=message)
+
     async def run(self) -> None:
         mode = self.config.mode
-        logger.info("orchestrator_started", mode=mode.value, target=self.config.target.service_id)
-
+        self._log_progress(f"Starte Orchestrator im Modus: {mode.value}")
         self.state_machine.start()
         self.state_machine.session_ready()
 
@@ -30,80 +53,116 @@ class BookingOrchestrator:
                 await self._run_interactive_exploration()
             else:
                 await self._run_live_attempt()
-
+        except asyncio.CancelledError:
+            self._log_progress("[WARN] Vorgang durch den Nutzer abgebrochen!")
+            raise
         except Exception as e:
             self.state_machine.fail(error=str(e))
             self.context.last_error = str(e)
             self.store.save(self.context.session_data)
-            logger.error("orchestrator_failed_but_state_saved", error=str(e))
+            self._log_progress(f"[CRITICAL_ERROR] {e}")
             raise
 
     async def _run_interactive_exploration(self) -> None:
-        """Der Dry-Run: Browser öffnen, User manuell navigieren lassen, Daten abspeichern."""
-        logger.info("starting_interactive_exploration")
-
+        self._log_progress("Starte Exploration. Automatischer Login läuft...")
         handoff_manager = BrowserHandoffManager()
-        extracted_session = await handoff_manager.explore_and_extract_session(
-            str(self.config.target_url)
+
+        ext_session = await handoff_manager.explore_and_extract_session(
+            str(self.config.target_url), self.context.session_data
         )
 
-        # 1. Cookies updaten
-        self.context.session_data.cookies.update(extracted_session.cookies)
-
-        # 2. NEU: Die abgefangenen JSON-Payloads in den Kontext mergen
-        self.context.session_data.known_payloads.update(extracted_session.known_payloads)
+        self.context.session_data.cookies.update(ext_session.cookies)
+        self.context.session_data.known_payloads.update(ext_session.known_payloads)
+        self.context.session_data.discovered_options = ext_session.discovered_options
 
         self.state_machine.slot_found()
         self.state_machine.slot_reserved()
         self.state_machine.stop_dry_run()
 
-        # Wissen auf Festplatte brennen (.data/session_state.json)
         self.store.save(self.context.session_data)
-        logger.info("exploration_completed_and_saved")
+        self._log_progress("Exploration erfolgreich abgeschlossen und gespeichert.")
 
     async def _run_live_attempt(self) -> None:
-        """Der scharfe Lauf: High-Speed API mit injizierten Cookies und mutierten Payloads."""
+        match = re.search(r"course_block_id/(\d+)", str(self.config.target_url))
+        target_id = match.group(1) if match else ""
+        if not target_id:
+            raise ValueError("Konnte keine Kurs-ID aus der URL extrahieren!")
+
         async with FastCheckoutApiClient(
             str(self.config.target_url), self.config.timeout_seconds
         ) as client:
-            # 1. Cookies aus der Exploration injizieren
             client.client.cookies.update(self.context.session_data.cookies)
+            strategy = self.context.session_data.strategy
 
-            # Warten auf den Release-Zeitpunkt
-            await asyncio.sleep(0.5)
+            if not strategy.actions:
+                raise ValueError("Keine Strategie geladen! Bitte zuerst kalibrieren.")
+
+            poll_path = str(self.config.target_url)
+            checkout_path = strategy.target_url.replace("{TARGET_ID}", target_id)
+            payload_string = strategy.generate_form_payload()
+
             self.state_machine.slot_found()
+            poll_sec = self.context.session_data.poll_interval_ms / 1000.0
+            self._log_progress(f"Scharf. Polling: {poll_sec}s. Ziel-ID: {target_id}")
 
-            target_id = self.config.target.service_id
-            logger.info("reserving_slot_via_api", service_id=target_id)
+            start_time = time.time()
+            attempt = 0
 
-            # 2. Payload laden (ACHTUNG: Den Key müssen wir nach der Exploration anpassen!)
-            # Wir nehmen an, wir haben den Request-Pfad beim Sniffen gesehen:
-            endpoint_key = "POST_/api/cart/add"
+            # --- DUAL-TRACK POLLING LOOP ---
+            while time.time() - start_time < 3600:
+                # Abbruchbedingung prüfen
+                if self._cancel_requested:
+                    raise asyncio.CancelledError("Polling vom User abgebrochen.")
 
-            if endpoint_key not in self.context.session_data.known_payloads:
-                raise ValueError(f"Payload für '{endpoint_key}' fehlt in .data/session_state.json!")
+                attempt += 1
+                try:
+                    poll_res = await client.client.get(poll_path)
+                    html_text = poll_res.text.lower()
 
-            payload = self.context.session_data.known_payloads[endpoint_key]
+                    if 'disabled="disabled"' in html_text and "customer_select" in html_text:
+                        self._log_progress(f"[Poll {attempt}] Slider deaktiviert. Warte...")
+                        await asyncio.sleep(poll_sec)
+                        continue
 
-            # 3. DYNAMISCHE MANIPULATION (Mutation)
-            # HIER ersetzen wir die Dummy-ID durch die echte Ziel-ID.
-            # (Der Key 'product_id' muss dem echten JSON des Shops entsprechen!)
-            payload["product_id"] = target_id
+                    if "noch nicht buchbar" in html_text or "nicht buchbar" in html_text:
+                        self._log_progress(f"[Poll {attempt}] Kurs gesperrt. Warte...")
+                        await asyncio.sleep(poll_sec)
+                        continue
 
-            # 4. Abfeuern mit Retry-Looping
-            endpoint_path = endpoint_key.split("_", 1)[
-                1
-            ]  # Macht aus 'POST_/api/cart/add' -> '/api/cart/add'
-            await client.submit_booking(endpoint_path, payload)
+                    self._log_progress(
+                        f"[SUCCESS] Kurs offen (Versuch {attempt})! Sende Buchung..."
+                    )
+
+                    checkout_res = await client.submit_booking(
+                        checkout_path, form_payload=payload_string, max_retries=1
+                    )
+
+                    # --- 🚨 TRACING: DER FLUGSCHREIBER 🚨 ---
+                    trace_file = Path(".data") / f"checkout_trace_{target_id}.html"
+                    trace_file.parent.mkdir(exist_ok=True)
+                    trace_file.write_text(checkout_res.text, encoding="utf-8")
+                    self._log_progress(f"[TRACE] Server-Antwort gesichert: {trace_file.name}")
+
+                    if "mindestens einen teilnehmer aus" in checkout_res.text.lower():
+                        raise ValueError("Warenkorb leer! Teilnehmer-ID wurde abgelehnt.")
+
+                    self._log_progress("[SUCCESS] Kurs gebucht! Handoff initiieren...")
+                    break
+
+                except Exception as e:
+                    self._log_progress(f"[ERROR] Polling-Fehler bei Versuch {attempt}: {e}")
+                    await asyncio.sleep(poll_sec)
 
             self.state_machine.slot_reserved()
-
-            # 5. Finale Übergabe an den Nutzer
             self.state_machine.proceed_to_payment()
-            logger.info("initiating_browser_handoff")
 
-            self.context.session_data.cookies.update(client.client.cookies)
+            base_match = re.match(r"(https?://[^/]+)", str(self.config.target_url))
+            base_url = base_match.group(1) if base_match else str(self.config.target_url)
+            cart_url = f"{base_url}/de/orders/cart"
+
+            for cookie in client.client.cookies.jar:
+                self.context.session_data.cookies[cookie.name] = cookie.value or ""
+
             handoff_manager = BrowserHandoffManager()
-            await handoff_manager.take_over(self.context.session_data, str(self.config.target_url))
-
+            await handoff_manager.take_over(self.context.session_data, cart_url)
             self.state_machine.payment_done()

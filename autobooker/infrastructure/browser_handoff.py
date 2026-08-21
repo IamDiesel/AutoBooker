@@ -3,149 +3,137 @@ from typing import Any
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import Request, async_playwright
+from playwright.async_api import (
+    Request,
+    async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
+from autobooker.application.dom_analyzer import DOMAnalyzerService
 from autobooker.domain.models import SessionData
 
 logger = structlog.get_logger(__name__)
 
 
 class BrowserHandoffManager:
-    """
-    Kapselt die Logik, um eine bestehende HTTP-Session (Cookies/Tokens) in einen
-    sichtbaren Playwright-Browser zu injizieren und an den User zu übergeben,
-    oder umgekehrt, um Sessions und Payloads manuell zu explorieren.
-    """
+    """Kapselt Session-Injection, Auto-Recovery, Login und JS-Manipulationen."""
 
     def __init__(self, timeout_ms: float = 60000.0) -> None:
         self.timeout_ms = timeout_ms
 
-    def _format_cookies_for_playwright(
-        self, cookies: dict[str, str], target_url: str
-    ) -> list[Any]:  # <--- HIER IST DER FIX: list[Any] löst alle Plattform-Konflikte
-        """Formatiert das flache Cookie-Dict in das von Playwright benötigte Format."""
-        domain = urlparse(target_url).netloc
-        return [
-            {
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": "/",
-            }
-            for name, value in cookies.items()
-        ]
+    def _format_cookies_for_playwright(self, cookies: dict[str, str], url: str) -> list[Any]:
+        domain = urlparse(url).netloc
+        return [{"name": k, "value": v, "domain": domain, "path": "/"} for k, v in cookies.items()]
 
     async def take_over(self, session_data: SessionData, target_url: str) -> None:
-        """
-        Startet den sichtbaren Browser, injiziert die Cookies, navigiert zur URL und pausiert.
-        Wird für 'Versuch 1' und 'Versuch 2' (Live-Lauf) genutzt, um an Paypal zu übergeben.
-        """
+        """Startet den Browser für den Live-Modus und übergibt an den User."""
         logger.info("browser_handoff_started", target_url=target_url)
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+            context = await browser.new_context(no_viewport=True)
 
-            context = await browser.new_context(
-                no_viewport=True,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/127.0.0.0 Safari/537.36"
-                ),
-            )
-
-            # 1. Session-Daten (Cookies) injizieren
             pw_cookies = self._format_cookies_for_playwright(session_data.cookies, target_url)
             if pw_cookies:
-                # Da pw_cookies nun list[Any] ist, meckert hier weder Windows noch Linux.
-                # Kein type: ignore mehr nötig!
-                await context.add_cookies(pw_cookies)
-                logger.info("cookies_injected", count=len(pw_cookies))
+                try:
+                    await context.add_cookies(pw_cookies)
+                except Exception as e:
+                    logger.warning("cookie_injection_warning", error=str(e))
 
-            # 2. Zielseite öffnen
             page = await context.new_page()
-            logger.info("navigating_to_payment_gateway")
-
             try:
                 await page.goto(target_url, timeout=self.timeout_ms)
             except Exception as e:
                 logger.warning("timeout_during_navigation", error=str(e))
 
-            # 3. MENSCHLICHE ÜBERGABE
-            logger.warning("HANDOFF ACTIVE: Bitte im Browser übernehmen und Zahlung abschließen!")
-            print("\n\a")  # Akustisches Signal
-
+            logger.warning("HANDOFF ACTIVE: Bitte übernehmen und Zahlung abschließen!")
+            print("\n\a")
             await page.pause()
-
-            logger.info("browser_handoff_completed_by_user")
             await browser.close()
 
-    async def explore_and_extract_session(self, start_url: str) -> SessionData:
-        """
-        Öffnet einen sichtbaren Browser für die manuelle Exploration (Dry-Run).
-        Snifft im Hintergrund Netzwerk-Traffic und extrahiert am Ende alle Cookies.
-        """
+    async def explore_and_extract_session(
+        self, start_url: str, session_data: SessionData
+    ) -> SessionData:
+        """Exploration mit linearem SSO-Login-Flow und Hard-Recovery."""
         logger.info("exploration_browser_started", url=start_url)
-
-        # Lokaler Speicher für unsere extrahierten Payloads
         captured_payloads: dict[str, Any] = {}
 
         async def sniff_requests(request: Request) -> None:
-            """Event-Handler: Hört passiv im Hintergrund auf jeden ausgehenden Netzwerk-Request."""
-            if request.method in ["POST", "PUT", "PATCH"]:
-                post_data = request.post_data
-                if post_data:
-                    try:
-                        # Versuche den Body als JSON zu parsen
-                        payload = json.loads(post_data)
-
-                        # Generiere einen eindeutigen Key, z.B. 'POST_/api/cart/add'
-                        parsed_url = urlparse(request.url)
-                        endpoint_key = f"{request.method}_{parsed_url.path}"
-
-                        captured_payloads[endpoint_key] = payload
-                        logger.info(
-                            "json_payload_intercepted",
-                            method=request.method,
-                            path=parsed_url.path,
-                        )
-                    except json.JSONDecodeError:
-                        # War kein JSON. Ignorieren wir hier.
-                        pass
+            if request.method in ["POST", "PUT", "PATCH"] and (post_data := request.post_data):
+                key = f"{request.method}_{urlparse(request.url).path}"
+                try:
+                    captured_payloads[key] = json.loads(post_data)
+                except json.JSONDecodeError:
+                    captured_payloads[key] = post_data
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-            context = await browser.new_context(
-                no_viewport=True,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/127.0.0.0 Safari/537.36"
-                ),
-            )
+            context = await browser.new_context(no_viewport=True)
             page = await context.new_page()
-
-            # --- NETZWERK-INTERCEPTION AKTIVIEREN ---
             page.on("request", sniff_requests)
 
-            logger.info("Navigiere zur Zielseite. Bitte explorieren (z.B. Login durchführen).")
+            # 1. Schritt: Wir rufen direkt den Kurs auf (triggert den SSO Redirect)
+            logger.info("navigating_to_target_to_trigger_login")
             await page.goto(start_url)
 
-            print("\n\a")
-            logger.warning(
-                "EXPLORATION ACTIVE: Wenn fertig, klicke im Playwright Inspector auf 'Resume'."
-            )
+            # 2. Schritt: Smart Login (Nur wenn Zugangsdaten vorliegen)
+            if session_data.username and session_data.password:
+                user_sel = 'input#username, input[name="username"], input[type="email"]'
+                pass_sel = 'input#password, input[name="password"], input[type="password"]'
+                btn_sel = 'input#kc-login, button[type="submit"], input[type="submit"]'
 
+                try:
+                    # Wir warten max. 5s, ob der Server uns auf eine Login-Maske geworfen hat
+                    await page.wait_for_selector(user_sel, timeout=5000, state="visible")
+                    logger.info("login_page_detected_starting_autofill")
+
+                    await page.fill(user_sel, session_data.username)
+                    await page.fill(pass_sel, session_data.password)
+
+                    # Klick und warten auf die Weiterleitung (bringt uns meist auf /de/home/)
+                    async with page.expect_navigation(timeout=15000):
+                        await page.click(btn_sel)
+
+                    logger.info("auto_login_success")
+                except PlaywrightTimeoutError:
+                    logger.info("no_login_form_found_assuming_already_logged_in")
+                except Exception as e:
+                    logger.warning("auto_login_error", error=str(e))
+
+            # 3. Schritt: Zwangsrückkehr zur Kursseite (Hard Recovery)
+            if "course_block_id" not in page.url:
+                logger.info("redirecting_back_to_course_page_from_sso_home")
+                await page.goto(start_url)
+                await page.wait_for_load_state("networkidle")
+
+            # 4. Schritt: UI Entsperren & Exploration freigeben
+            unlock_js = (
+                "document.querySelectorAll('.customer_select, input[disabled]')"
+                ".forEach(e => e.removeAttribute('disabled'));"
+            )
+            await page.evaluate(unlock_js)
+            await context.add_init_script(f"setInterval(() => {{ {unlock_js} }}, 1000);")
+
+            print("\n\a")
+            logger.warning("EXPLORATION ACTIVE: Wenn fertig, auf 'Resume' klicken!")
             await page.pause()
 
-            # --- WISSENSEXTRAKTION (Cookies + Payloads) ---
+            # 5. Schritt: Daten extrahieren
+            analyzer = DOMAnalyzerService()
+            discovered_options = await analyzer.extract_bookable_options(page)
+
             pw_cookies = await context.cookies()
             cookies_dict = {c["name"]: c["value"] for c in pw_cookies}
 
-            logger.info(
-                "exploration_completed",
-                cookies_count=len(cookies_dict),
-                payloads_found=len(captured_payloads),
+            return SessionData(
+                cookies=cookies_dict,
+                known_payloads=captured_payloads,
+                discovered_options=discovered_options,
+                dummy_url=session_data.dummy_url,
+                live_url=session_data.live_url,
+                poll_interval_ms=session_data.poll_interval_ms,
+                username=session_data.username,
+                password=session_data.password,
             )
-
-            return SessionData(cookies=cookies_dict, known_payloads=captured_payloads)
